@@ -9,7 +9,7 @@
     "url": "https://github.com/chenlinz0122/hdu-campus.git"
   },
   "scripts": {
-    "test": "node --test \"bot/tests/*.test.js\"",
+    "test": "node --test",
     "start": "node bot/hdu-bot.js"
   },
   "dependencies": {

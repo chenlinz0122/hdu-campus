@@ -20,11 +20,14 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
       - run: npm install --no-audit --no-fund
-      - run: node --test "bot/tests/*.test.js"
+      - run: node --test
 
   python:
     name: Python unit tests
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
