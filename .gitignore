@@ -1,0 +1,28 @@
+# 本机配置与凭据（示例文件保留）
+config/*.json
+!config/*.example.json
+*.local.json
+.env
+
+# 运行时产物
+state/
+*.log
+*.sqlite
+*.sqlite-journal
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# 第三方二进制与打包残留
+bin/*.exe
+*.orig
+*.zip
+.DS_Store
+Thumbs.db

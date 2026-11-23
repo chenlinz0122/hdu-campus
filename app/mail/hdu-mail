@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""hdu-mail — 杭电校园邮箱(网易企业邮) 极简 IMAP/SMTP 客户端
+
+零第三方依赖。凭据存于 ~/.config/hdu-mail/config.json (0600)。
+可用环境变量 HDU_MAIL_USER / HDU_MAIL_PASS 覆盖。
+"""
+
+import argparse
+import email
+import email.policy
+import getpass
+import imaplib
+import json
+import os
+import re
+import smtplib
+import ssl
+import sys
+from datetime import datetime, timedelta
+from email.header import decode_header, make_header
+from email.message import EmailMessage
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("HDU_MAIL_CONFIG", "~/.config/hdu-mail")).expanduser()
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+# imaplib 的 Commands 表里没有 ID (RFC 2971)，需手动注册才能发送
+imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED")
+
+IMAP_HOST = "imap.qiye.163.com"
+SMTP_HOST = "smtp.qiye.163.com"
+SMTP_PORT = 465
+TIMEOUT = 30
+
+# ---------------------------------------------------------------- credentials
+
+
+def load_config():
+    addr = os.environ.get("HDU_MAIL_USER")
+    secret = os.environ.get("HDU_MAIL_PASS")
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+        except json.JSONDecodeError:
+            sys.exit(f"配置损坏: {CONFIG_FILE}")
+        addr = addr or cfg.get("address")
+        secret = secret or cfg.get("password")
+    if not addr or not secret:
+        sys.exit(
+            "未配置凭据。运行: hdu-mail init\n"
+            "或设置环境变量 HDU_MAIL_USER / HDU_MAIL_PASS"
+        )
+    return addr, secret
+
+
+def cmd_init(args):
+    default = ""
+    if CONFIG_FILE.exists():
+        try:
+            default = json.loads(CONFIG_FILE.read_text()).get("address", "")
+        except Exception:
+            pass
+    prompt = f"邮箱地址{f' [{default}]' if default else ''}: "
+    addr = input(prompt).strip() or default
+    if not addr:
+        sys.exit("地址不能为空")
+    secret = getpass.getpass("客户端授权密码(输入不回显): ").strip()
+    if not secret:
+        sys.exit("授权密码不能为空")
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(
+        json.dumps({"address": addr, "password": secret}, ensure_ascii=False, indent=2)
+    )
+    os.chmod(CONFIG_FILE, 0o600)
+    print(f"✓ 已写入 {CONFIG_FILE} (0600)")
+    print("下一步: hdu-mail test")
+
+
+# ---------------------------------------------------------------- imap layer
+
+
+def connect_imap(addr, secret):
+    try:
+        imap = imaplib.IMAP4_SSL(IMAP_HOST, 993, timeout=TIMEOUT)
+    except (OSError, ssl.SSLError) as e:
+        sys.exit(f"IMAP 连接失败 ({IMAP_HOST}:993): {e}")
+    try:
+        imap.login(addr, secret)
+    except imaplib.IMAP4.error as e:
+        sys.exit(
+            f"IMAP 登录失败: {e}\n"
+            "常见原因: 1) 用的是登录密码而非「客户端授权密码」 "
+            "2) 网页版没开启 IMAP 服务"
+        )
+    # 网易企业邮强制要求 ID，否则返回 "Unsafe Login"
+    try:
+        imap._simple_command(
+            "ID",
+            '("name" "hdu-mail" "version" "1.0" "vendor" "python-imaplib")',
+        )
+        imap._untagged_response("OK", [None], "ID")
+    except Exception:
+        pass
+    return imap
+
+
+def decode_mailbox(name):
+    """IMAP 的 modified UTF-7 -> 可读中文"""
+    if "&" not in name:
+        return name
+    try:
+        return name.replace("&", "+").replace(",", "/").encode().decode("utf-7")
+    except Exception:
+        return name
+
+
+def encode_mailbox(name):
+    """可读中文 -> IMAP modified UTF-7"""
+    try:
+        name.encode("ascii")
+        return name
+    except UnicodeEncodeError:
+        return name.encode("utf-7").decode().replace("+", "&").replace("/", ",")
+
+
+def parse_mailbox_arg(raw):
+    """网易企业邮的文件夹名多为 UTF-7 编码，直接透传。"""
+    return raw
+
+
+def select(imap, mailbox="INBOX"):
+    typ, dat = imap.select(f'"{encode_mailbox(mailbox)}"', readonly=True)
+    if typ != "OK":
+        sys.exit(f"无法打开邮箱 {mailbox}: {dat}")
+
+
+def _decode(v):
+    if not v:
+        return ""
+    try:
+        return str(make_header(decode_header(v)))
+    except Exception:
+        return v
+
+
+def _body_text(msg, limit=4000):
+    """优先 text/plain，回退到剥标签的 text/html。"""
+    plain, html = None, None
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            if part.get_filename():
+                continue
+            ctype = part.get_content_type()
+            try:
+                payload = part.get_payload(decode=True)
+            except Exception:
+                continue
+            if payload is None:
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                text = payload.decode(charset, errors="replace")
+            except LookupError:
+                text = payload.decode("utf-8", errors="replace")
+            if ctype == "text/plain" and plain is None:
+                plain = text
+            elif ctype == "text/html" and html is None:
+                html = text
+    else:
+        payload = msg.get_payload(decode=True) or b""
+        charset = msg.get_content_charset() or "utf-8"
+        text = payload.decode(charset, errors="replace")
+        if msg.get_content_type() == "text/html":
+            html = text
+        else:
+            plain = text
+
+    text = plain
+    if text is None and html is not None:
+        text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
+        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+        text = re.sub(r"</(p|div|tr|li|h[1-6])>", "\n", text, flags=re.I)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = (
+            text.replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+        )
+    text = text or ""
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()[:limit]
+
+
+def summarize(uid, raw):
+    msg = email.message_from_bytes(raw, policy=email.policy.compat32)
+    try:
+        dt = parsedate_to_datetime(msg.get("Date"))
+        when = dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        when = msg.get("Date", "?")
+    atts = [
+        p.get_filename()
+        for p in (msg.walk() if msg.is_multipart() else [])
+        if p.get_filename()
+    ]
+    return {
+        "uid": uid,
+        "date": when,
+        "from": _decode(msg.get("From")),
+        "to": _decode(msg.get("To")),
+        "subject": _decode(msg.get("Subject")),
+        "attachments": [_decode(a) for a in atts],
+        "flags": "",
+    }
+
+
+def fetch_summaries(imap, uids):
+    out = []
+    # 批量拉取比逐封快很多；163 对每次 FETCH 数量有限制，分块处理
+    CHUNK = 50
+    for i in range(0, len(uids), CHUNK):
+        chunk = uids[i : i + CHUNK]
+        idset = ",".join(chunk)
+        typ, dat = imap.uid(
+            "FETCH",
+            idset,
+            "(FLAGS BODY.PEEK[HEADER.FIELDS (DATE FROM TO SUBJECT)])",
+        )
+        if typ != "OK":
+            continue
+        cur_uid = None
+        for item in dat:
+            if isinstance(item, tuple):
+                head = item[0].decode("utf-8", "replace") if isinstance(item[0], bytes) else str(item[0])
+                m = re.search(r"UID (\d+)", head)
+                if m:
+                    cur_uid = m.group(1)
+                raw = item[1]
+                if cur_uid:
+                    s = summarize(cur_uid, raw)
+                    fm = re.search(r"FLAGS \(([^)]*)\)", head)
+                    s["flags"] = fm.group(1) if fm else ""
+                    out.append(s)
+    order = {u: i for i, u in enumerate(uids)}
+    out.sort(key=lambda x: order.get(x["uid"], 0))
+    return out
+
+
+def uid_list(imap, criteria):
+    typ, dat = imap.uid("SEARCH", None, *criteria)
+    if typ != "OK":
+        return []
+    raw = dat[0].decode() if dat and dat[0] else ""
+    return raw.split()
+
+
+def hdu_date(s):
+    return datetime.strptime(s, "%Y-%m-%d").strftime("%d-%b-%Y")
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_test(args):
+    addr, secret = load_config()
+    print(f"配置用户: {addr}")
+    print("IMAP ...", end=" ", flush=True)
+    imap = connect_imap(addr, secret)
+    typ, dat = imap.noop()
+    print("OK")
+    typ, dat = imap.list()
+    n = len(dat or [])
+    print(f"文件夹:  {n} 个")
+    imap.logout()
+
+    print("SMTP ...", end=" ", flush=True)
+    try:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=TIMEOUT) as s:
+            s.login(addr, secret)
+        print("OK")
+    except Exception as e:
+        sys.exit(f"失败: {e}")
+    print("\n✓ 读写通道均可用")
+
+
+def cmd_mailboxes(args):
+    addr, secret = load_config()
+    imap = connect_imap(addr, secret)
+    typ, dat = imap.list()
+    rows = []
+    for line in dat or []:
+        s = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+        m = re.match(r'\((?P<flags>[^)]*)\)\s+"?(?P<delim>[^"\s]*)"?\s+(?P<name>.*)$', s)
+        if m:
+            name = m.group("name").strip().strip('"')
+            rows.append({"name": name, "display": decode_mailbox(name), "flags": m.group("flags")})
+    imap.logout()
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+    for r in rows:
+        f = r["flags"].replace("\\", "")
+        print(f"{r['display']:<16} {f:<14} ({r['name']})")
+
+
+def all_mailboxes(imap):
+    typ, dat = imap.list()
+    out = []
+    for line in dat or []:
+        s = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+        m = re.match(r'\((?P<flags>[^)]*)\)\s+"?(?P<delim>[^"\s]*)"?\s+(?P<name>.*)$', s)
+        if not m:
+            continue
+        name = m.group("name").strip().strip('"')
+        if "\\Noselect" in m.group("flags"):
+            continue
+        if name.upper() == "[GMAIL]":
+            continue
+        out.append(name)
+    return out
+
+
+def cmd_list(args):
+    addr, secret = load_config()
+    imap = connect_imap(addr, secret)
+
+    def collect(mailbox):
+        select(imap, mailbox)
+        criteria = []
+        if args.unread:
+            criteria.append("UNSEEN")
+        if args.since:
+            criteria += ["SINCE", hdu_date(args.since)]
+        if not criteria:
+            criteria = ["ALL"]
+        uids = uid_list(imap, criteria)
+        if not uids:
+            return []
+        # 先截断再拉取：全量 FETCH 在大邮箱上会非常慢
+        if not getattr(args, "all", False) and args.limit:
+            uids = uids[-args.limit :]
+        rows = fetch_summaries(imap, uids)
+        for r in rows:
+            r["mailbox"] = decode_mailbox(mailbox)
+        return rows
+
+    if getattr(args, "all", False):
+        rows = []
+        for mb in all_mailboxes(imap):
+            try:
+                rows += collect(mb)
+            except SystemExit:
+                continue
+    else:
+        rows = collect(args.mailbox)
+
+    imap.logout()
+
+    rows.sort(key=lambda r: r["date"], reverse=True)
+    if args.limit:
+        rows = rows[: args.limit]
+
+    if args.from_:
+        rows = [r for r in rows if args.from_.lower() in r["from"].lower()]
+    if args.subject:
+        rows = [r for r in rows if args.subject.lower() in r["subject"].lower()]
+
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+    if not rows:
+        print("(没有匹配的邮件)")
+        return
+    for r in rows:
+        mark = "●" if "\\Seen" not in r["flags"] else " "
+        att = f" [附件x{len(r['attachments'])}]" if r["attachments"] else ""
+        box = f"[{r.get('mailbox','')}] " if getattr(args, "all", False) else ""
+        print(f"{mark} {r['uid']:>7}  {r['date']}  {box}{r['from'][:34]:<34}  {r['subject']}{att}")
+
+
+def cmd_read(args):
+    addr, secret = load_config()
+    imap = connect_imap(addr, secret)
+    select(imap, args.mailbox)
+    typ, dat = imap.uid("FETCH", args.uid, "(BODY.PEEK[])")
+    if typ != "OK" or not dat or not isinstance(dat[0], tuple):
+        sys.exit(f"取不到 UID {args.uid}")
+    raw = dat[0][1]
+    imap.logout()
+
+    msg = email.message_from_bytes(raw, policy=email.policy.compat32)
+    body = _body_text(msg, limit=args.chars)
+    meta = summarize(args.uid, raw)
+    atts = [
+        _decode(p.get_filename())
+        for p in (msg.walk() if msg.is_multipart() else [])
+        if p.get_filename()
+    ]
+
+    if args.json:
+        meta["body"] = body
+        meta["attachments"] = atts
+        print(json.dumps(meta, ensure_ascii=False, indent=2))
+        return
+    print(f"UID:    {args.uid}")
+    print(f"日期:   {meta['date']}")
+    print(f"发件人: {meta['from']}")
+    print(f"收件人: {meta['to']}")
+    print(f"主题:   {meta['subject']}")
+    if atts:
+        print(f"附件:   {', '.join(atts)}")
+    print("-" * 60)
+    print(body)
+
+
+def cmd_search(args):
+    addr, secret = load_config()
+    imap = connect_imap(addr, secret)
+
+    def run_box(mailbox):
+        select(imap, mailbox)
+        criteria = []
+        if args.since:
+            criteria += ["SINCE", hdu_date(args.since)]
+        if args.unread:
+            criteria.append("UNSEEN")
+        if not criteria:
+            criteria = ["ALL"]
+        uids = uid_list(imap, criteria)
+        if not uids:
+            return []
+        # 搜索需要先扫更大范围再过滤，否则只会命中最后 N 封
+        scan = max(args.limit * 10, 300)
+        uids = uids[-scan:]
+        rows = fetch_summaries(imap, uids)
+        for r in rows:
+            r["mailbox"] = decode_mailbox(mailbox)
+        return rows
+
+    boxes = all_mailboxes(imap) if getattr(args, "all", False) else [args.mailbox]
+    rows = []
+    for mb in boxes:
+        try:
+            rows += run_box(mb)
+        except SystemExit:
+            continue
+    imap.logout()
+
+    if args.from_:
+        rows = [r for r in rows if args.from_.lower() in r["from"].lower()]
+    if args.subject:
+        rows = [r for r in rows if args.subject.lower() in r["subject"].lower()]
+    if args.text:
+        kw = args.text.lower()
+        rows = [r for r in rows if kw in r["subject"].lower() or kw in r["from"].lower()]
+
+    rows.sort(key=lambda r: r["date"], reverse=True)
+    rows = rows[: args.limit]
+
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+    if not rows:
+        print("(无结果)")
+        return
+    for r in rows:
+        box = f"[{r.get('mailbox','')}] " if getattr(args, "all", False) else ""
+        print(f"{r['uid']:>7}  {r['date']}  {box}{r['from'][:34]:<34}  {r['subject']}")
+
+
+def cmd_attachments(args):
+    addr, secret = load_config()
+    imap = connect_imap(addr, secret)
+    select(imap, args.mailbox)
+    typ, dat = imap.uid("FETCH", args.uid, "(BODY.PEEK[])")
+    imap.logout()
+    if typ != "OK":
+        sys.exit(f"取不到 UID {args.uid}")
+    msg = email.message_from_bytes(dat[0][1], policy=email.policy.compat32)
+
+    outdir = Path(args.out).expanduser()
+    outdir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for part in msg.walk() if msg.is_multipart() else []:
+        fn = part.get_filename()
+        if not fn:
+            continue
+        fn = _decode(fn)
+        fn = re.sub(r'[/\\\x00-\x1f]', "_", fn)  # 防路径穿越
+        target = outdir / fn
+        payload = part.get_payload(decode=True) or b""
+        target.write_bytes(payload)
+        saved.append(str(target))
+    if args.json:
+        print(json.dumps(saved, ensure_ascii=False, indent=2))
+    else:
+        print(f"保存 {len(saved)} 个附件到 {outdir}")
+        for s in saved:
+            print("  " + s)
+
+
+def cmd_send(args):
+    addr, secret = load_config()
+    body = sys.stdin.read() if args.body == "-" else args.body
+    if not body:
+        sys.exit("正文为空: 用 --body TEXT 或 --body - 从 stdin 读")
+
+    msg = EmailMessage()
+    msg["From"] = addr
+    msg["To"] = ", ".join(args.to)
+    msg["Subject"] = args.subject
+    if args.cc:
+        msg["Cc"] = ", ".join(args.cc)
+    msg.set_content(body)
+
+    for f in args.attach or []:
+        p = Path(f).expanduser()
+        if not p.is_file():
+            sys.exit(f"附件不存在: {p}")
+        msg.add_attachment(
+            p.read_bytes(),
+            maintype="application",
+            subtype="octet-stream",
+            filename=p.name,
+        )
+
+    if args.dry_run:
+        print(msg.as_string()[:2000])
+        print("\n[dry-run] 未发送")
+        return
+
+    rcpts = list(args.to) + list(args.cc or [])
+    try:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=TIMEOUT) as s:
+            s.login(addr, secret)
+            s.send_message(msg, from_addr=addr, to_addrs=rcpts)
+    except Exception as e:
+        sys.exit(f"发送失败: {e}")
+    if args.json:
+        print(json.dumps({"sent": True, "to": rcpts, "subject": args.subject}, ensure_ascii=False))
+    else:
+        print(f"✓ 已发送给 {', '.join(rcpts)}")
+
+
+# ---------------------------------------------------------------- cli
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="hdu-mail",
+        description="杭电校园邮箱(网易企业邮) IMAP/SMTP 客户端",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  hdu-mail init                       # 交互配置凭据(不回显)
+  hdu-mail test                       # 验证读写通道
+  hdu-mail mailboxes                  # 列出文件夹
+  hdu-mail list --unread --limit 20   # 最近未读
+  hdu-mail list --since 2026-10-01 --json
+  hdu-mail read 1234                  # 看 UID 1234 正文
+  hdu-mail attachments 1234 --out ~/Downloads/mail
+  hdu-mail send --to a@b.com --subject hi --body "内容"
+""",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init", help="配置凭据").set_defaults(func=cmd_init)
+    sub.add_parser("test", help="测试连接").set_defaults(func=cmd_test)
+    sp = sub.add_parser("mailboxes", help="列出文件夹")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_mailboxes)
+
+    def add_json(sp):
+        sp.add_argument("--json", action="store_true", help="JSON 输出")
+
+    sp = sub.add_parser("list", help="列出邮件")
+    sp.add_argument("--mailbox", default="INBOX")
+    sp.add_argument("--all", action="store_true", help="遍历所有文件夹")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--unread", action="store_true")
+    sp.add_argument("--since", help="YYYY-MM-DD")
+    sp.add_argument("--from", dest="from_", help="发件人包含(本地过滤)")
+    sp.add_argument("--subject", help="主题包含(本地过滤)")
+    add_json(sp)
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("read", help="查看单封邮件")
+    sp.add_argument("uid")
+    sp.add_argument("--mailbox", default="INBOX")
+    sp.add_argument("--chars", type=int, default=4000)
+    add_json(sp)
+    sp.set_defaults(func=cmd_read)
+
+    sp = sub.add_parser("search", help="搜索邮件")
+    sp.add_argument("--mailbox", default="INBOX")
+    sp.add_argument("--all", action="store_true", help="遍历所有文件夹")
+    sp.add_argument("--from", dest="from_")
+    sp.add_argument("--subject")
+    sp.add_argument("--text", help="主题/发件人关键词(本地过滤)")
+    sp.add_argument("--since")
+    sp.add_argument("--unread", action="store_true")
+    sp.add_argument("--limit", type=int, default=50)
+    add_json(sp)
+    sp.set_defaults(func=cmd_search)
+
+    sp = sub.add_parser("attachments", help="下载附件")
+    sp.add_argument("uid")
+    sp.add_argument("--mailbox", default="INBOX")
+    sp.add_argument("--out", default="./hdu-mail-attachments")
+    add_json(sp)
+    sp.set_defaults(func=cmd_attachments)
+
+    sp = sub.add_parser("send", help="发送邮件")
+    sp.add_argument("--to", action="append", required=True)
+    sp.add_argument("--cc", action="append")
+    sp.add_argument("--subject", required=True)
+    sp.add_argument("--body", default="-", help="正文，'-' 表示从 stdin 读")
+    sp.add_argument("--attach", action="append")
+    sp.add_argument("--dry-run", action="store_true")
+    add_json(sp)
+    sp.set_defaults(func=cmd_send)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

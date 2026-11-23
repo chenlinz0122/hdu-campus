@@ -1,0 +1,3 @@
+HDU Campus Windows 1.2.0
+
+babb01f1557f7f111dc414f496b9ce7cff4872dcec11a828dc1935814852d25c  bin/hduhelp-cli.exe

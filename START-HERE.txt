@@ -1,0 +1,32 @@
+HDU 校园助手 · Windows 快速开始
+================================
+
+1. 安装 Node.js 18+ 和 Python 3.10+（都勾选 Add to PATH）
+2. 解压到固定目录，例如 C:\hdu-campus
+3. 双击 setup.cmd，按提示填写：
+   - 飞书 App ID / App Secret
+   - 模型 API Key（默认 DeepSeek）
+   - 校园邮箱（可跳过）
+   - 杭电账号（会打开浏览器）
+4. 按 README.md 第 3 节配置飞书：
+   - 事件订阅 im.message.receive_v1（长连接）
+   - 回调配置 card.action.trigger（长连接）
+   - 发布应用版本
+5. 把机器人拉进群/私聊，发一条消息
+6. 开启日报：bot.cmd --digest-on 8:00
+7. 启动/自启：
+   start-bot.vbs
+   install-autostart.cmd
+
+文档：
+  README.md
+  docs\FEISHU-SETUP.md
+  docs\PROTOCOL.md
+  docs\ARCHITECTURE.md
+  docs\RAG.md
+
+遇到问题先看：
+  %APPDATA%\hdu-campus\state\console.log
+  %APPDATA%\hdu-campus\state\bot.log
+  bot.cmd --check
+  bot.cmd --health

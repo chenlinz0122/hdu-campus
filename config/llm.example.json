@@ -1,0 +1,9 @@
+{
+  "apiKey": "sk-REPLACE_ME",
+  "baseUrl": "https://api.deepseek.com/v1",
+  "model": "deepseek-chat",
+  "timeoutMs": 40000,
+  "maxRetries": 1,
+  "temperature": 0.3,
+  "fallback": []
+}

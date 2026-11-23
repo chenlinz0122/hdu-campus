@@ -1,0 +1,21 @@
+{
+  "name": "hdu-campus-app",
+  "version": "1.2.0",
+  "private": true,
+  "description": "HDU Campus runtime: Feishu bot, local knowledge base (RAG) and campus mail CLI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chenlinz0122/hdu-campus.git"
+  },
+  "scripts": {
+    "test": "node --test \"bot/tests/*.test.js\"",
+    "start": "node bot/hdu-bot.js"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.76.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

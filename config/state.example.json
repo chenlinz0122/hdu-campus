@@ -1,0 +1,20 @@
+{
+  "digest": {
+    "enabled": false,
+    "hour": 8,
+    "minute": 0,
+    "chats": [],
+    "lastSent": null
+  },
+  "sunrunTarget": 36,
+  "sunrunDeadline": "2026-12-18",
+  "weeklySunrun": {
+    "enabled": false,
+    "weekday": 1,
+    "hour": 8,
+    "minute": 0,
+    "chats": [],
+    "lastSent": null
+  },
+  "allowedChats": []
+}
